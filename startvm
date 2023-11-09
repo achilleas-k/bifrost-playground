@@ -1,0 +1,164 @@
+#!/usr/bin/env bash
+
+set -eu
+lowhost="$(hostname | tr "[:upper:]" "[:lower:]")"
+pubkeyfile="${HOME}/.ssh/${lowhost}.pub"
+sshport=2222
+webport=10443
+rundir="${XDG_RUNTIME_DIR}/osbuild-vm"
+overlaydir=/media/scratch/bifrost/overlays
+mkdir -p "${overlaydir}"
+
+usage() {
+    echo "$0 DISK NAME"
+    echo
+    echo "Create an overlay from a given disk, install osbuild and osbuild-composer, and start the services."
+    echo "Creates a user account with:"
+    echo "  Username: $USER"
+    echo "  Password: password42"
+    echo "  Public key from:"
+    echo "    - ${pubkeyfile}"
+    echo
+    echo "DISK   path to VM disk to boot"
+    echo "NAME   names the VM to start or resume"
+    exit 1
+}
+
+case $# in
+    2)
+        baseimg="$1"
+        imgname="$2"
+        ;;
+    3)
+        baseimg="$1"
+        imgname="$2"
+        ;;
+    *)
+        usage
+esac
+
+
+while echo 1 > "/dev/tcp/localhost/${sshport}"; do
+    ((sshport++))
+done
+echo "Forwarding port ${sshport} for SSH"
+
+while echo 1 > "/dev/tcp/localhost/${webport}"; do
+    ((webport++))
+done
+echo "Forwarding port ${webport} for https"
+
+arch_args=(
+)
+
+sshcmd() {
+    ssh -q -p "${sshport}" localvm "$*"
+}
+
+mkoverlay() {
+    baseimg="$1"
+    image="$2"
+    qemu-img create -o backing_file="${baseimg}",backing_fmt=qcow2 -f qcow2 "${image}"
+    qemu-img resize "${image}" 100G
+}
+
+
+mkcloudinit() {
+    # Adapted from gicmo's vm script
+    genisoimage -input-charset utf-8 -output "${rundir}/${1}" -volid cidata -joliet -rock -quiet "${rundir}/data/user-data" "${rundir}/data/meta-data"
+}
+
+pubkey="$(cat "${pubkeyfile}")"
+mkuserdata() {
+    mkdir -p "${rundir}/data"
+    cat > "${rundir}/data/user-data" << EOF
+#cloud-config
+users:
+  - default
+  - name: ${USER}
+    gecos: AK
+    sudo: 'ALL=(ALL) NOPASSWD:ALL'
+    ssh_pwauth: True
+    ssh_authorized_keys:
+      - ${pubkey}
+  - name: root
+    gecos: AK
+    ssh_pwauth: True
+    ssh_authorized_keys:
+      - ${pubkey}
+timezone: CET
+chpasswd:
+  list: |
+    root:r
+    ${USER}:password42
+  expire: False
+EOF
+}
+
+mkmetadata() {
+    mkdir -p "${rundir}/data"
+    cat > "${rundir}/data/meta-data" << EOF
+instance-id: nocloud
+local-hostname: ${1}
+EOF
+}
+
+startvm() {
+    mac="FE:0B:6E:22:3D:99"
+    if (( $# == 2 )); then
+        cd_arg=("-cdrom" "${rundir}/${2}")
+    fi
+    "qemu-system-x86_64"  \
+        -nographic \
+        -smp cpus=8 \
+        -m 8G \
+        -drive file="${1}" \
+        -device virtio-net-pci,netdev=n0,mac="${mac}" \
+        -netdev user,id=n0,net=10.0.2.0/24,hostfwd=tcp::"${sshport}"-:22,hostfwd=tcp::"${webport}"-:443,hostfwd=tcp::9090-:9090 \
+        -enable-kvm \
+        -cpu "host" \
+        "${cd_arg[@]}" \
+        &
+    waitfor "${sshport}"
+    echo "VM started"
+}
+
+waitfor() {
+    while ! ssh -q localvm -p "${1}" exit; do
+        sleep 1
+    done
+}
+
+installbuildtools() {
+    sshcmd sudo dnf install -y go make git krb5-devel jq vim gpgme-devel rpm-ostree bootc podman skopeo
+    sshcmd git config --global user.email "testvm@osbuild.org"
+    sshcmd git config --global user.name "${USER}"
+}
+
+fixdns() {
+    sshcmd "sudo tee /etc/resolv.conf" << EOF
+nameserver 10.38.5.26
+nameserver 10.0.2.3
+EOF
+}
+
+baseimgfname=$(basename "${baseimg}")
+image="${overlaydir}/${baseimgfname%.*}-${imgname}.qcow2"
+
+if [[ -e "${image}" ]]; then
+    echo "Booting existing VM ${image}"
+    startvm "${image}"
+    fixdns
+else
+    echo "Setting up new VM using ${baseimg} -> ${image}"
+    mkoverlay "${baseimg}" "${image}"
+    mkuserdata
+    mkmetadata "${imgname}-vm"
+    mkcloudinit composer-init.iso
+    startvm "${image}" composer-init.iso
+    fixdns
+
+    installbuildtools
+fi
+
+sshcmd sudo journalctl -fa
