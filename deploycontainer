@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+
+ssh localvm sudo podman run --rm --privileged --pid=host -v /:/target --security-opt label=type:unconfined_t mine bootc install-to-filesystem --target-no-signature-verification --karg=console=ttyS0,115200n8 --replace=alongside /target

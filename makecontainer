@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+
+ssh localvm mkdir mine
+scp Dockerfile localvm:mine/
+
+ssh localvm sudo podman build mine -t mine
